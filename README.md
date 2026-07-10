@@ -1,238 +1,266 @@
 # Bearing Fault Detection
 
-End-to-end pipeline: raw vibration waveforms → engineered features → physics-informed
-labels (harmonics + sidebands + SNR) → trained fault classifiers (BPFI/BPFO/BSF/FTF) →
-daily live scoring against the AAMS API → Streamlit dashboard.
+This project takes raw vibration waveforms from bearings, turns them into engineered
+features, labels them using a physics-based confidence score (harmonics, sidebands,
+SNR against the bearing's known fault frequencies), and trains classifiers for four
+fault types: BPFI, BPFO, BSF, and FTF. It also handles daily scoring against the live
+AAMS API and ships with a local Streamlit dashboard to look at all of it.
+
+The short version of where things stand: velocity is the primary signal used for daily
+predictions (per current guidance), acceleration is still trained and available for
+comparison, and there's a mixed-domain option that routes each fault to whichever
+domain actually performs better for it, in case that's useful later.
+
+## Pipeline at a glance
+
+![Pipeline architecture](docs/images/pipeline_architecture/one.png)
+
+Training and daily prediction are two separate entry points, but they run through the
+exact same feature extraction and labeling code, so there's no risk of the two paths
+quietly drifting apart from each other.
+
+## Dataset overview
+
+![Overview tab](docs/images/overview/one.png)
+![Overview tab](docs/images/overview/two.png)
+
+
+## Screenshots
+
+Markdown only shows an image if there's an actual `![...](path)` line pointing at a
+file that exists — nothing here updates itself automatically, so the naming below is
+fixed on purpose. Save your screenshots using these exact names (numbered 1, 2, 3) and
+they'll show up in the relevant section further down this file. Fewer than 3 is fine —
+an image tag pointing at a file that doesn't exist yet just won't render, no error.
+
+```
+docs/images/
+├── overview/
+│   ├── 1.png
+│   ├── 2.png
+│   └── 3.png
+├── model-performance/
+│   ├── 1.png
+│   ├── 2.png
+│   └── 3.png
+├── normal-flag-check/
+│   ├── 1.png
+│   ├── 2.png
+│   └── 3.png
+└── daily-predictions/
+    ├── 1.png
+    ├── 2.png
+    └── 3.png
+```
+
+To capture them: run `streamlit run dashboard/app.py`, click through each tab, save a
+screenshot into the matching folder using the numbers above, commit. If you want more
+than 3 per tab, add `4.png` etc. to the folder and add a matching `![...]()` line next
+to the others in that section.
 
 ## Project structure
 
 ```
 bearing_fault_detection/
-├── config.py                  # all paths, API creds, labeling/feature constants
+├── config.py                   # paths, API creds, labeling/feature constants, domain switching
 ├── requirements.txt
+├── .env                        # your AAMS credentials (not committed — see .env.example)
 ├── data/
-│   └── raw/                   # <-- put your data here: YYYY-MM-DD/ folders + catalogue.json
+│   ├── raw/                    # historical data: YYYY-MM-DD/ folders + catalogue.json
+│   └── live/                   # daily API pulls land here, same layout as data/raw/
 ├── src/
-│   ├── feature_extraction.py  # per-packet time/frequency/FFT-peak feature computation
-│   ├── build_dataset.py       # raw JSON -> outputs/waveform.csv (matches your exact schema)
-│   ├── labeling.py            # shaft_frequency, BPFI/BPFO/BSF/FTF, confidence scoring, labels
-│   ├── train.py                # GroupKFold CV (XGB/LightGBM/RF), SMOTE, saves best model per fault
-│   ├── evaluate_normal.py     # applies trained models to held-out Normal rows (false-positive check)
-│   ├── api_client.py           # AAMS API wrapper (login / list bearings / get raw)
-│   ├── predict_daily.py       # pulls today's data from the live API and scores it
-│   └── predict_utils.py       # shared model-loading / prediction helpers
+│   ├── feature_extraction.py   # time/frequency/envelope-spectrum feature computation
+│   ├── build_dataset.py        # raw JSON -> waveform.csv, shared by training and daily prediction
+│   ├── labeling.py             # fault frequencies, confidence scoring, binary labels
+│   ├── train.py                # StratifiedGroupKFold CV, hyperparameter search, SMOTETomek
+│   ├── evaluate_normal.py      # false-positive check against held-out Normal bearings
+│   ├── api_client.py           # pooled-connection AAMS API wrapper
+│   ├── fetch_live_data.py      # saves live API data to disk + merges with local catalogue
+│   ├── predict_daily.py        # daily fetch + build + score
+│   └── predict_utils.py        # model loading, prediction, the mixed-domain ensemble class
 ├── dashboard/
-│   └── app.py                  # Streamlit dashboard (local only)
-├── models/                     # saved models + encoders + meta.json (created by train.py)
-├── outputs/                    # all generated CSVs (created by the scripts)
+│   └── app.py                  # Streamlit dashboard, local only
+├── models/                     # acceleration models (train.py output)
+├── models_velocity/            # velocity models (train.py --domain velocity output)
+├── outputs/                    # generated CSVs — features, labels, CV results, predictions
 └── scripts_dev/
-    └── gen_synthetic.py         # generates fake data to smoke-test the pipeline — not for production
+    └── gen_synthetic.py        # fake data generator for smoke-testing, not for real use
 ```
 
 ## Setup
 
 ```bash
 cd bearing_fault_detection
-python -m venv venv && source venv/bin/activate      # optional but recommended
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Point the project at your real data by editing `config.py` (or environment variables):
+Copy `.env.example` to `.env` and fill in your real values:
+
+```
+AAMS_EMAIL=your-ml-service-account@email.com
+AAMS_PASSWORD=your-password
+```
+
+`config.py` loads this automatically (`python-dotenv`) — you don't need to export
+anything manually. `.env` is in `.gitignore`; only `.env.example` (with placeholder
+values) is meant to be committed.
+
+If your historical data lives somewhere other than `data/raw/`, point at it either in
+`config.py` or via environment variables:
 
 ```bash
 export BFD_RAW_DATA_ROOT="/path/to/your/date-folders"
 export BFD_CATALOGUE_PATH="/path/to/your/date-folders/catalogue.json"
-export AAMS_EMAIL="ml-service@yourcompany.com"
-export AAMS_PASSWORD="********"
 ```
 
-Your raw data folder should look like your screenshot:
+Your data folder should look like:
 
 ```
-raw_data/
+data/raw/
 ├── 2026-05-22/
-│   ├── <bearing_capture_1>.json
+│   ├── <bearingLocationId>.json
 │   └── ...
 ├── 2026-05-25/
-├── 2026-06-01/
 ├── ...
 └── catalogue.json
 ```
 
-Each waveform JSON file is expected to look like the example you shared: a top-level
-`bearingLocationId`, `date`, `status`, and a `packets` list, where each packet has
-`samples`, `sampling_rate`/`sr`, `axis`, etc. (Both the live-API camelCase field names
-and your local snake_case field names are handled automatically — see
-`normalize_packet()` in `feature_extraction.py`.)
+Each waveform file has a top-level `bearingLocationId`, `date`, `status`, and a
+`packets` list — each packet carrying `samples`, `sampling_rate`/`sr`, `axis`, and so
+on. Both the live API's camelCase field names and local snake_case names are handled
+(`normalize_packet()` in `feature_extraction.py`), so files from either source work
+without modification.
 
-`catalogue.json` should be the list of bearing metadata dicts (your example with
-`machineRpm`, `innerRacePass`, `outerRacePass`, `rollElementPass`, `cageRotation`, etc.),
-keyed by `bearingLocationId`.
+`catalogue.json` is the bearing metadata list — `machineRpm`, `innerRacePass`,
+`outerRacePass`, `rollElementPass`, `cageRotation`, etc. — keyed by `bearingLocationId`.
 
-## Run order (from the project root)
-
-```bash
-# 1. Extract features from every raw waveform file -> outputs/waveform.csv
-python -m src.build_dataset
-
-# 2. Compute shaft_frequency, BPFI/BPFO/BSF/FTF (Hz), confidence scores, and binary labels
-python -m src.labeling
-
-# 3. Train models (Marginal + Unacceptable rows only) and save to models/
-python -m src.train
-
-# 4. Check how many Normal-status bearings the trained model still flags (false-positive check)
-python -m src.evaluate_normal
-
-# 5. (Optional, CLI) pull today's data from the live API and score it
-python -m src.predict_daily                    # defaults to today (UTC)
-python -m src.predict_daily --date 2026-07-06  # or a specific date
-
-# 6. Launch the dashboard
-streamlit run dashboard/app.py
-```
-
-The dashboard also has a **"Fetch & Predict"** button on the Daily Live Predictions tab,
-so you don't have to run step 5 from the command line — it calls the same code directly.
-
-## How labeling works (unchanged from your original strategy)
-
-For every packet:
-1. `shaft_frequency = machineRpm / 60`
-2. `BPFI/BPFO/BSF/FTF (Hz) = catalogue_multiplier * shaft_frequency`
-3. For each fault frequency, check:
-   - **Harmonics**: peaks near `1x, 2x, 3x, 4x` the fault frequency (±3% tolerance)
-   - **Sidebands**: peaks near `fault_freq ± k*shaft_freq` for k=1,2 (only if shaft_freq known)
-   - **Local SNR**: best-matched harmonic amplitude vs. median amplitude of all other peaks
-4. Confidence = `0.5*harmonic_score + 0.3*sideband_score + 0.2*snr_score`, hard-capped to
-   30% of its value if the SNR gate fails.
-5. Binary label = `confidence >= threshold` (default `balanced` = 0.50; see `config.LABEL_THRESHOLD`).
-
-All of this lives in `src/labeling.py`, unchanged logically from what you had, just
-wired up to compute `shaft_frequency`/`BPFI`/`BPFO`/`BSF`/`FTF` from the catalogue first.
-
-## Training strategy
-
-- **Training set**: only rows with `status in ['Marginal', 'Unacceptable']`
-  (per your instruction — the labeling heuristic is most trustworthy on equipment
-  already known to be degraded).
-- **GroupKFold by `bearingLocationId`**: no single bearing's packets leak across
-  train/test folds.
-- **SMOTE**: applied only inside each training fold (and again on the full training
-  set for the final refit) — never on test data.
-- **Model selection**: XGBoost / LightGBM / RandomForest compared per fault; the
-  best (highest mean F1) is refit on the full training set and saved.
-- Faults with fewer than 5 positive examples are skipped (not enough for 5-fold CV) —
-  you'll see this reported explicitly when you run `train.py`.
-
-## Normal-bearing false-positive check
-
-`evaluate_normal.py` (and the dashboard's "✅ Normal-Bearing Flag Check" tab) applies
-the trained models to every `Normal`-status row that was **held out of training** and
-reports what fraction get flagged as faulty. This is your over-triggering / false-alarm
-rate on equipment that's supposedly healthy — worth watching per fault type, since a
-high rate on one fault (vs. the others) usually means that fault's labeling threshold
-or feature set needs tightening.
-
-## What changed in the F1-improvement pass
-
-Four changes were made together to raise model quality (not just re-balance the
-existing precision/recall trade-off):
-
-1. **Envelope-spectrum features** (`feature_extraction.py`, `labeling.py`) — the
-   standard bearing-diagnostics technique: rectify the signal via its Hilbert-transform
-   envelope, then FFT that envelope. Bearing impact frequencies show up far more cleanly
-   here than in the raw spectrum. New columns: `envelope_dominant_frequency`,
-   `envelope_max_amplitude`, `envelope_spectral_entropy`, `envelope_energy`, and
-   `{fault}_envelope_amp` (envelope amplitude right at each fault's base frequency) —
-   the latter is a genuine new model feature, not a leakage column.
-2. **StratifiedGroupKFold** instead of plain `GroupKFold` (`train.py`) — stratifies
-   folds by the fault label (not just by bearing), which is why your F1_std was so
-   large before (±0.2-0.3): some folds had very different fault composition than others.
-3. **Per-fault hyperparameter search** (`RandomizedSearchCV`, small grid, `train.py`) —
-   each fault now gets its own tuned XGBoost/LightGBM/RandomForest instead of one
-   fixed hyperparameter set for all four faults.
-4. **SMOTETomek instead of plain SMOTE**, and a **soft-voting ensemble** of the three
-   tuned models compared against each individually — whichever wins (by mean F1) gets
-   saved and used.
-
-None of this touches labeling — your tuned `LOCAL_SNR_MULT=4.0` and
-`harmonics_matched < 2` rule are unchanged. Rerun the full chain (`build_dataset` →
-`labeling` → `train` → `evaluate_normal`) since the feature schema changed (envelope
-columns are new), even though the labels themselves won't change.
-
-Two things to know before you run it:
-- **Training now takes noticeably longer** — hyperparameter search runs a small
-  `RandomizedSearchCV` per model per fault before the final CV comparison.
-- **`SoftVotingEnsemble`** (in `predict_utils.py`) is a small custom model class used
-  when the ensemble wins for a given fault. It's saved/loaded via `joblib` like any
-  other model — nothing else needs to change on your end, `evaluate_normal.py`,
-  `predict_daily.py`, and the dashboard all already import from `predict_utils.py`
-  where this class lives.
-
-## Acceleration vs. Velocity comparison
-
-Every script now supports `--domain {acceleration,velocity}` (default: `acceleration`).
-`velocity` mode integrates the raw acceleration waveform (in g) into velocity (in mm/s)
-via frequency-domain integration — the standard technique, and the ISO-10816 convention
-for overall vibration severity — before running the exact same feature extraction,
-labeling, and training code. Nothing about the architecture differs between the two;
-only the signal being analyzed does.
-
-Outputs are kept fully separate so you can run and compare both:
-
-| | acceleration (default) | velocity |
-|---|---|---|
-| raw features | `outputs/waveform.csv` | `outputs/waveform_velocity.csv` |
-| labeled | `outputs/waveform_labeled.csv` | `outputs/waveform_labeled_velocity.csv` |
-| CV summary | `outputs/cv_summary.csv` | `outputs/cv_summary_velocity.csv` |
-| normal-flag report | `outputs/normal_flag_report.csv` | `outputs/normal_flag_report_velocity.csv` |
-| saved models | `models/` | `models_velocity/` |
-
-Run both full chains, then compare:
+## Running the training pipeline
 
 ```bash
-# acceleration (as before)
-python -m src.build_dataset
-python -m src.labeling
-python -m src.train
-python -m src.evaluate_normal
-
-# velocity
+# velocity — this is what actually gets used for daily predictions
 python -m src.build_dataset --domain velocity
 python -m src.labeling --domain velocity
 python -m src.train --domain velocity
 python -m src.evaluate_normal --domain velocity
 
-# side-by-side comparison (F1/precision/recall/AUC + normal-flag rate, both domains)
-python compare_domains.py
+# acceleration — kept around for comparison, not used daily right now
+python -m src.build_dataset
+python -m src.labeling
+python -m src.train
+python -m src.evaluate_normal
 ```
 
-`check_recall.py` and `threshold_sweep.py` also accept `--domain velocity` if you want
-to compare recall-vs-flag-rate trade-off curves between the two.
+Then, whenever you want:
 
-## F1 reporting: two numbers, don't confuse them
+```bash
+streamlit run dashboard/app.py
+```
 
-`train.py`'s CV output now shows two F1 values per model:
+## How labeling works
 
-- **`F1`** — computed at scikit-learn's default 0.5 probability cutoff. This is what all earlier
-  numbers in this project referred to.
-- **`F1@optThresh`** — the *best possible* F1 on that fold, found by scanning all thresholds via
-  `precision_recall_curve`. This is an **upper bound, not a deployable number** — it picks the
-  best threshold using that fold's own test labels, which you don't have at real prediction time.
-  Use it to see how much headroom threshold tuning could theoretically buy you; use
-  `threshold_sweep.py` (which reports recall/flag-rate honestly out-of-sample) to actually pick
-  a deployable threshold.
+For every packet:
 
-Changing `config.PREDICTION_THRESHOLD(S)` does **not** change either of these numbers — that
-setting only affects inference-time scripts (`evaluate_normal.py`, `predict_daily.py`, the
-dashboard, `evaluate_normal_mixed.py`), not the CV metrics reported during training.
+1. `shaft_frequency = machineRpm / 60`
+2. `BPFI / BPFO / BSF / FTF (Hz) = catalogue multiplier × shaft_frequency`
+3. Check the packet's spectrum for:
+   - harmonics — peaks near 1×, 2×, 3×, 4× the fault frequency (±3% by default)
+   - sidebands — peaks near `fault_freq ± k × shaft_freq` for k = 1, 2
+   - local SNR — the strongest matched harmonic against the median amplitude of
+     everything else nearby
+4. Those three combine into a confidence score, weighted 0.5 / 0.3 / 0.2, and get
+   knocked down hard if the SNR gate or the harmonic-count check fails.
+5. Confidence above the threshold (currently strict, 0.70) becomes a positive label.
 
-## Mixed-domain production system
+This lives in `src/labeling.py`. There's a `--label-mode` flag (`strict` / `balanced` /
+`loose`) if you want to experiment with the threshold without touching `config.py` —
+worth knowing that loosening it was tried on the velocity domain at one point and made
+things measurably worse in practice (higher F1 on paper, but a worse false-alarm rate
+on real healthy bearings), so it's back to strict. `config.DOMAIN_OVERRIDES` still has
+the machinery to set different labeling parameters per domain if you want to revisit
+that later — it's just empty right now.
 
-Since acceleration and velocity don't win the same faults (see the comparison above — velocity
-wins FTF by a wide margin, acceleration wins the other three), `config.FAULT_DOMAIN` routes each
-fault to whichever domain's model actually performs best for it:
+## Training strategy
+
+![Model performance tab](docs/images/model-performance/one.png)
+![Model performance tab](docs/images/model-performance/two.png)
+
+- Trains only on rows where `status` is `Marginal` or `Unacceptable` — the labeling
+  heuristic is most trustworthy on equipment already known to be degraded, and Normal
+  rows are held back entirely to check for false positives instead.
+- Cross-validation uses `StratifiedGroupKFold` — grouped by bearing (no single bearing's
+  packets split across train and test) and stratified by the fault label, so folds
+  don't end up with wildly different fault rates from each other.
+- Each fault gets its own small `RandomizedSearchCV` hyperparameter search across
+  XGBoost, LightGBM, and RandomForest, plus a soft-voting ensemble of the three —
+  whichever comes out on top by mean F1 gets refit on the full training set and saved.
+- `SMOTETomek` handles class imbalance, applied only within training folds (never on
+  validation/test data).
+- A fault with fewer than 5 positive examples gets skipped rather than force-fit —
+  you'll see this called out directly when you run `train.py`.
+
+## Normal-bearing false-positive check
+
+![Normal-flag check tab](docs/images/normal-flag-check/one.png)
+
+
+`evaluate_normal.py` runs the trained models against every Normal-status row that was
+held out of training, and reports what fraction get flagged anyway. That's your
+real-world false-alarm rate — worth watching per fault, since a spike on one fault
+relative to the others is usually a sign that fault's labeling or features need
+another look. This is a more trustworthy signal than F1 alone: F1 depends on how the
+labels were drawn, this doesn't.
+
+## Envelope-spectrum features
+
+Bearing fault impacts tend to get buried under structural and gearbox noise in the raw
+spectrum. Envelope analysis — rectify the signal via its Hilbert-transform envelope,
+then take the FFT of that — surfaces the repetitive impact frequency much more clearly,
+which is the standard approach in real bearing diagnostics. `feature_extraction.py`
+computes this (`envelope_dominant_frequency`, `envelope_max_amplitude`,
+`envelope_spectral_entropy`, `envelope_energy`), and `labeling.py` adds
+`{fault}_envelope_amp` — the envelope amplitude right at each fault's specific
+frequency — as a genuine model input, separate from anything used to build the labels
+themselves.
+
+## Acceleration vs. velocity
+
+Every script takes `--domain {acceleration,velocity}`. Velocity mode integrates the raw
+acceleration signal (g) into velocity (mm/s) via frequency-domain integration — this is
+the ISO-10816 convention for vibration severity — before running through identical
+feature extraction, labeling, and training code. Outputs are kept fully separate:
+
+| | acceleration | velocity |
+|---|---|---|
+| features | `outputs/waveform.csv` | `outputs/waveform_velocity.csv` |
+| labeled | `outputs/waveform_labeled.csv` | `outputs/waveform_labeled_velocity.csv` |
+| models | `models/` | `models_velocity/` |
+
+`compare_domains.py` puts both side by side (CV metrics + normal-flag rate). In
+practice acceleration came out ahead for BPFI, BPFO, and BSF, while velocity clearly
+won FTF — which lines up with the physics, since integration amplifies low frequencies
+and FTF is the lowest of the four fault frequencies.
+
+## F1, and why the number by itself isn't the whole story
+
+`train.py` reports two F1 values per model: the normal one at a 0.5 probability cutoff,
+and `F1@optThresh`, the best F1 achievable on that fold by scanning every threshold.
+The second number is a ceiling, not something you can actually promise in production —
+it's picking the best threshold using labels you won't have at real prediction time.
+`threshold_sweep.py` is the honest version of this, showing recall against flag-rate
+across thresholds, out of sample.
+
+Also worth internalizing: F1 is only comparable across two runs if the label
+definition didn't change between them. Loosen the labeling threshold and F1 will often
+go up — not because the model got better, but because the classification task got
+easier (more of the data now counts as "positive"). The number that stays meaningful
+regardless is the flag rate on real Normal-status bearings, since that's measured
+against unchanged ground truth every time.
+
+## Mixed-domain option
+
+Since acceleration and velocity don't win the same faults, `config.FAULT_DOMAIN` can
+route each fault to whichever domain performs best for it:
 
 ```python
 FAULT_DOMAIN = {
@@ -243,87 +271,74 @@ FAULT_DOMAIN = {
 }
 ```
 
-`src/predict_utils.py` has two new functions to support this:
-- `load_mixed_artifacts()` — loads each fault's model from its routed domain's `models/` folder.
-- `predict_faults_mixed()` — runs each fault against the right domain's features and merges
-  results into one table (join key: `bearingLocationId`, `date`, `axis`, `packet_number`).
+`predict_utils.py` has `load_mixed_artifacts()` and `predict_faults_mixed()` to support
+this, and `evaluate_normal_mixed.py` / `python -m src.predict_daily --mode mixed` will
+run it end to end. It's not the default daily path right now (velocity-only is), but
+it's there if a mixed approach makes more sense down the line.
 
-`evaluate_normal_mixed.py` validates the actual system you'd deploy — both domains' models
-together, each fault using its own domain and threshold — against held-out Normal bearings.
-This is the number that matters most; the individual per-domain `evaluate_normal.py` runs are
-useful for comparison, but `evaluate_normal_mixed.py` is what a real deployment looks like.
+## Daily prediction
 
-## Daily prediction: how it actually works
+![Daily predictions tab](docs/images/daily-predictions/one.png)
+![Daily predictions tab](docs/images/daily-predictions/two.png)
 
-`predict_daily.py` does NOT run a separate in-memory feature pipeline anymore — it
-saves live API data to disk and reuses your exact `build_dataset.py`/`labeling.py`
-code, so training-time and prediction-time feature computation can't silently drift
-apart. The flow:
-
-1. Login, fetch the live bearing catalogue + today's raw waveforms from the API.
-2. **Save raw waveforms to `data/live/{date}/*.json`** — same schema as your historical
-   `data/raw/{date}/` files.
-3. **Merge the live catalogue with your local `catalogue.json`** (`src/fetch_live_data.py`
-   `build_merged_catalogue()`) — the live `GET /ml/bearings` response often doesn't include
-   bearing geometry (`innerRacePass`/`outerRacePass`/`rollElementPass`/`cageRotation`), even
-   though your bulk `catalogue.json` does. Live values win when present (status, rpm, etc.);
-   geometry falls back to your local catalogue, keyed by `bearingLocationId`. The merged
-   result is saved to `data/live/{date}/catalogue.json`.
-4. **Any bearing missing geometry in BOTH sources gets a warning printed** (bearing IDs
-   listed), not a silent guess or a crash. Its `shaft_frequency` still computes correctly
-   (only needs live `machineRpm`), but its raw geometry feature columns are `NaN` — those
-   get filled with **training-set median values** at prediction time (`prepare_features()`
-   in `predict_utils.py`, same median-imputation logic used everywhere else in this
-   project), and its `{fault}_envelope_amp` features fall back to `0.0` (meaning "no signal
-   found at an unknown frequency") rather than crashing or producing garbage. If you see
-   these warnings repeatedly for the same bearings, add their geometry to your local
-   `catalogue.json` — the fallback is safe, not ideal.
-5. **`build_dataset.build()`** — the same function used for historical data — runs against
-   the saved `data/live/{date}/` folder + merged catalogue, once per domain.
-6. **`labeling.compute_prediction_features()`** — the same function used at training time —
-   adds `shaft_frequency`, `BPFI`/`BPFO`/`BSF`/`FTF` (Hz), and `{fault}_envelope_amp`.
-7. Scored with the trained models (mixed system by default, per `config.FAULT_DOMAIN`).
-
-## Fetching speed (large fleets)
-
-`fetch_live_data.py` fetches all (bearing, axis) pairs in parallel via a thread pool
-(`--workers`, default 20) with a hard wall-clock deadline (`--deadline`, default 1800s/30min)
-so a handful of slow/stuck requests can't block the whole run — whatever completes by the
-deadline is kept, stragglers are logged and skipped. No customer filtering — fetches
-everything `list_bearings()` returns for your account's scope.
 
 ```bash
-python -m src.predict_daily --workers 30 --deadline 3600   # more parallelism, longer deadline
-python -m src.predict_daily --deadline 0                    # no deadline, wait for everything
+python -m src.predict_daily                       # velocity only, today
+python -m src.predict_daily --date 2026-07-09
+python -m src.predict_daily --workers 40 --deadline 1800
+python -m src.predict_daily --mode mixed           # if you want the mixed-domain system instead
 ```
 
-## Domain-specific thresholds (config.get_param)
+What actually happens on a run:
 
-Peak-detection sensitivity and labeling strictness can now differ per domain via
-`config.DOMAIN_OVERRIDES` + `config.get_param("NAME")`, instead of one fixed value used
-everywhere. Currently velocity uses deliberately looser settings than acceleration
-(lower FFT peak prominence, wider harmonic/sideband tolerance, lower SNR gate, "loose"
-label mode) — acceleration's tuned strict settings are untouched. `build_dataset.build()`
-calls `config.set_domain()` itself now (not just the CLI), so this resolves correctly no
-matter what called it from — including `predict_daily.py`, which builds both domains in
-one run.
+1. Log in, then fetch the full bearing catalogue and today's raw waveforms — one API
+   call per bearing (the API returns every axis in a single response when `axis` is
+   left off, so there's no need to call it per axis).
+2. Save the raw waveforms to `data/live/{date}/`, same file layout as the historical
+   data, so `build_dataset.py` and `labeling.py` can run on live data completely
+   unchanged rather than needing a separate code path.
+3. Merge the live catalogue with your local `catalogue.json`. The live API often
+   doesn't return bearing geometry (`innerRacePass`, `outerRacePass`, etc.), so this
+   fills in whatever's missing from your local file, keyed by `bearingLocationId`.
+   Anything still missing after that gets flagged (`geometry_known = False` in the
+   output, plus a printed warning listing the bearing IDs) rather than silently
+   guessed — those rows fall back to training-set median values instead of crashing.
+4. Run the same `build_dataset.build()` and `labeling.compute_prediction_features()`
+   used at training time, then score with the trained models.
+5. Results land in `outputs/daily_predictions_latest_velocity.csv` (this run only) and
+   get appended to `outputs/daily_predictions_velocity.csv` (running history).
 
-If you retune either domain further, edit `config.DOMAIN_OVERRIDES["velocity"]` (or add
-an `"acceleration"` key) rather than the base `HARMONIC_TOLERANCE_PCT`/etc. values directly
-— those are still the acceleration/default values other code falls back to.
+The dashboard's Daily Live Predictions tab does the same thing through a "Fetch &
+Predict" button, with velocity selected by default.
 
-## Notes / things to sanity-check on your real data
+## Fetching speed
 
-- `predict_daily.py` calls the live AAMS API directly (needs `AAMS_EMAIL`/`AAMS_PASSWORD`
-  for a `SUPER_ADMIN` or `ANALYST` (customer scope `["*"]`) account, per the API doc).
-  It was not run against the live API in this environment (no network access to
-  `apiv3.aams.io` from here) — test it from your own machine first with a single bearing
-  before running it over your whole fleet.
-- The full pipeline (`build_dataset` → `labeling` → `train` → `evaluate_normal`) **was**
-  run end-to-end here against synthetic data with injected BPFI/BPFO fault signatures,
-  and produced sensible results (correct positive rates, correct feature/label separation,
-  no leakage). See `scripts_dev/gen_synthetic.py` if you want to regenerate that test data.
-- `innerRacePass`/`outerRacePass`/`rollElementPass`/`cageRotation` are assumed to be
-  **multipliers of shaft frequency** (the standard bearing-fault convention — e.g. BPFI
-  ≈ 4.9x shaft speed for a typical bearing). Double check one bearing's numbers against
-  a known-good reference if these labels look off.
+A few things matter here if you're pulling from a large fleet:
+
+- `api_client.py` keeps a single pooled `requests.Session` instead of opening a fresh
+  connection per call — with tens of thousands of requests, reusing connections instead
+  of paying a handshake every time makes a real difference.
+- The bearing catalogue is fetched in one unfiltered paginated walk (the API returns
+  every measuring type when you don't filter), rather than looping once per type.
+- Requests run in parallel across a thread pool (`--workers`, default 40), with a hard
+  wall-clock deadline (`--deadline`, default 1800 seconds) so a handful of slow or stuck
+  requests can't block the whole run — whatever's finished by the deadline gets kept,
+  stragglers get logged and skipped.
+
+```bash
+python -m src.predict_daily --workers 60 --deadline 3600
+python -m src.predict_daily --deadline 0     # no deadline at all
+```
+
+## A couple of things worth double-checking on your data
+
+- `innerRacePass` / `outerRacePass` / `rollElementPass` / `cageRotation` are treated as
+  multipliers of shaft frequency (the standard convention — BPFI is typically around
+  4.9× shaft speed for a common bearing). Spot-check one bearing's numbers against a
+  known reference if the labels ever look off.
+- `predict_daily.py` needs a live AAMS account with `SUPER_ADMIN` or `ANALYST`
+  (customer scope `["*"]`) access per the API docs. Test it against a single day before
+  trusting it on your full fleet.
+- If you ever see the same bearing IDs showing up repeatedly in the "missing geometry"
+  warning, that's a sign to add them to your local `catalogue.json` — the fallback
+  behavior is safe but not as accurate as having the real numbers.
