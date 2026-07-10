@@ -13,7 +13,7 @@ domain actually performs better for it, in case that's useful later.
 
 ## Pipeline at a glance
 
-![Pipeline architecture](docs/images/pipeline_architecture/one.png)
+![Pipeline architecture](docs/images/pipeline-architecture/one.png)
 
 Training and daily prediction are two separate entry points, but they run through the
 exact same feature extraction and labeling code, so there's no risk of the two paths
@@ -25,38 +25,6 @@ quietly drifting apart from each other.
 ![Overview tab](docs/images/overview/two.png)
 
 
-## Screenshots
-
-Markdown only shows an image if there's an actual `![...](path)` line pointing at a
-file that exists — nothing here updates itself automatically, so the naming below is
-fixed on purpose. Save your screenshots using these exact names (numbered 1, 2, 3) and
-they'll show up in the relevant section further down this file. Fewer than 3 is fine —
-an image tag pointing at a file that doesn't exist yet just won't render, no error.
-
-```
-docs/images/
-├── overview/
-│   ├── 1.png
-│   ├── 2.png
-│   └── 3.png
-├── model-performance/
-│   ├── 1.png
-│   ├── 2.png
-│   └── 3.png
-├── normal-flag-check/
-│   ├── 1.png
-│   ├── 2.png
-│   └── 3.png
-└── daily-predictions/
-    ├── 1.png
-    ├── 2.png
-    └── 3.png
-```
-
-To capture them: run `streamlit run dashboard/app.py`, click through each tab, save a
-screenshot into the matching folder using the numbers above, commit. If you want more
-than 3 per tab, add `4.png` etc. to the folder and add a matching `![...]()` line next
-to the others in that section.
 
 ## Project structure
 
@@ -95,26 +63,15 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and fill in your real values:
 
 ```
 AAMS_EMAIL=your-ml-service-account@email.com
 AAMS_PASSWORD=your-password
 ```
 
-`config.py` loads this automatically (`python-dotenv`) — you don't need to export
-anything manually. `.env` is in `.gitignore`; only `.env.example` (with placeholder
-values) is meant to be committed.
+`config.py` loads this automatically (`python-dotenv`) 
 
-If your historical data lives somewhere other than `data/raw/`, point at it either in
-`config.py` or via environment variables:
-
-```bash
-export BFD_RAW_DATA_ROOT="/path/to/your/date-folders"
-export BFD_CATALOGUE_PATH="/path/to/your/date-folders/catalogue.json"
-```
-
-Your data folder should look like:
+Data folder
 
 ```
 data/raw/
@@ -330,15 +287,3 @@ python -m src.predict_daily --workers 60 --deadline 3600
 python -m src.predict_daily --deadline 0     # no deadline at all
 ```
 
-## A couple of things worth double-checking on your data
-
-- `innerRacePass` / `outerRacePass` / `rollElementPass` / `cageRotation` are treated as
-  multipliers of shaft frequency (the standard convention — BPFI is typically around
-  4.9× shaft speed for a common bearing). Spot-check one bearing's numbers against a
-  known reference if the labels ever look off.
-- `predict_daily.py` needs a live AAMS account with `SUPER_ADMIN` or `ANALYST`
-  (customer scope `["*"]`) access per the API docs. Test it against a single day before
-  trusting it on your full fleet.
-- If you ever see the same bearing IDs showing up repeatedly in the "missing geometry"
-  warning, that's a sign to add them to your local `catalogue.json` — the fallback
-  behavior is safe but not as accurate as having the real numbers.
