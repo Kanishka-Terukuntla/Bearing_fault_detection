@@ -1,9 +1,8 @@
 """
-Thin wrapper around the AAMS ML Data API described in ML_DATA_API.pdf.
 
     POST /auth/login
-    GET  /ml/bearings
-    GET  /ml/bearings/{bearingLocationId}/raw
+    GET  /ml/bearings  -- endpoint one where
+    GET  /ml/bearings/{bearingLocationId}/raw  --- api end point 2
 
 Performance notes (this is the client used for daily bulk fetching, which can
 mean tens of thousands of requests):
